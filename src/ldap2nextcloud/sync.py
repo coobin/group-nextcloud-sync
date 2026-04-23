@@ -17,7 +17,10 @@ class GroupSyncStats:
     inactive_users_seen: int = 0
     users_seen: int = 0
     users_missing: int = 0
+    users_resolved_by_email: int = 0
     users_without_matching_department_group: int = 0
+    unmatched_only_default_users: int = 0
+    unmatched_with_existing_groups: int = 0
     duplicate_display_names: int = 0
     managed_groups: int = 0
     memberships_added: int = 0
@@ -30,11 +33,13 @@ class NextcloudGroupSyncService:
 
     def sync(self, snapshot: HrSnapshot) -> GroupSyncStats:
         stats = GroupSyncStats()
+        unmatched_only_default_details: list[tuple[str, str, str]] = []
         stats.departments_seen = len(snapshot.departments)
         self._ensure_group(self.settings.nextcloud_default_group)
 
         groups = self._load_groups()
         users = self._load_users()
+        users_by_email = self._load_users_by_email(users)
         memberships = self._load_group_memberships()
         membership_count = sum(len(gids) for gids in memberships.values())
         self._log(
@@ -59,14 +64,15 @@ class NextcloudGroupSyncService:
         stats.managed_groups = len(managed_gids)
 
         for employee in snapshot.employees:
+            target_uid = self._resolve_target_uid(employee.username, employee.email, users, users_by_email, stats)
             if not employee.active:
                 stats.inactive_users_seen += 1
-                self._remove_user_from_managed_groups(employee.username, memberships, managed_gids, stats)
+                self._remove_user_from_managed_groups(target_uid, memberships, managed_gids, stats)
                 continue
 
             stats.users_seen += 1
             stats.active_users_seen += 1
-            if employee.username not in users:
+            if target_uid not in users:
                 stats.users_missing += 1
                 self._log("WARN", f"user missing in nextcloud uid={employee.username}")
                 continue
@@ -83,13 +89,17 @@ class NextcloudGroupSyncService:
                     desired_gids.add(matched_gid)
                 else:
                     stats.users_without_matching_department_group += 1
-                    self._log(
-                        "WARN",
-                        "department display name not found "
-                        f"uid={employee.username} department={department.name} target={target_display_name}"
-                    )
+                    current_groups = memberships.get(target_uid, set())
+                    has_other_groups = any(gid != self.settings.nextcloud_default_group for gid in current_groups)
+                    if has_other_groups:
+                        stats.unmatched_with_existing_groups += 1
+                    else:
+                        stats.unmatched_only_default_users += 1
+                        unmatched_only_default_details.append(
+                            (target_uid, department.name, target_display_name)
+                        )
 
-            self._sync_user_memberships(employee.username, desired_gids, managed_gids, memberships, stats)
+            self._sync_user_memberships(target_uid, desired_gids, managed_gids, memberships, stats)
 
         for display_name, gids in sorted(duplicate_display_names.items()):
             self._log(
@@ -97,6 +107,21 @@ class NextcloudGroupSyncService:
                 "duplicate group display name ignored "
                 f"displayName={display_name} gids={', '.join(sorted(gids))}"
             )
+
+        if stats.users_without_matching_department_group > 0:
+            self._log(
+                "WARN",
+                "department group unmatched summary "
+                f"total={stats.users_without_matching_department_group} "
+                f"only_default={stats.unmatched_only_default_users} "
+                f"with_existing_groups={stats.unmatched_with_existing_groups}",
+            )
+            for uid, department, target in sorted(unmatched_only_default_details):
+                self._log(
+                    "WARN",
+                    "only default group "
+                    f"uid={uid} department={department} target={target}",
+                )
         return stats
 
     def _index_groups_by_display_name(
@@ -191,6 +216,50 @@ class NextcloudGroupSyncService:
     def _load_users(self) -> set[str]:
         rows = self._query("SELECT uid FROM oc_users")
         return {row["uid"] for row in rows}
+
+    def _load_users_by_email(self, users: set[str]) -> dict[str, list[str]]:
+        rows = self._query(
+            "SELECT p.userid, p.configvalue "
+            "FROM oc_preferences p "
+            "JOIN oc_users u ON u.uid = p.userid "
+            "WHERE p.appid='settings' AND p.configkey='email' AND p.configvalue <> ''"
+        )
+        users_by_email: dict[str, list[str]] = defaultdict(list)
+        for row in rows:
+            uid = row["userid"]
+            email = row["configvalue"].strip().lower()
+            if uid in users and email:
+                users_by_email[email].append(uid)
+        return users_by_email
+
+    def _resolve_target_uid(
+        self,
+        username: str,
+        email: str | None,
+        users: set[str],
+        users_by_email: dict[str, list[str]],
+        stats: GroupSyncStats,
+    ) -> str:
+        if username in users:
+            return username
+        if not email:
+            return username
+
+        candidates = sorted(set(users_by_email.get(email.strip().lower(), [])))
+        if len(candidates) == 1:
+            resolved_uid = candidates[0]
+            stats.users_resolved_by_email += 1
+            self._log(
+                "INFO",
+                f"user mapped by email username={username} resolved_uid={resolved_uid} email={email}",
+            )
+            return resolved_uid
+        if len(candidates) > 1:
+            self._log(
+                "WARN",
+                f"user email matched multiple nextcloud users username={username} email={email} candidates={','.join(candidates)}",
+            )
+        return username
 
     def _load_group_memberships(self) -> dict[str, set[str]]:
         rows = self._query("SELECT uid, gid FROM oc_group_user")
