@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+dist/
+build/
+*.egg-info/
+*.tar.gz
+*.tgz
+*.zip
+*.key
+*.pem
+*.crt
+*.p12

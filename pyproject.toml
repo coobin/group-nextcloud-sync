@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "group-nextcloud-sync"
+version = "0.1.0"
+description = "Sync HR users into existing Nextcloud groups by display name."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "PyMySQL>=1.1.1",
+  "requests>=2.32.0",
+]
+
+[project.scripts]
+group-nextcloud-sync = "ldap2nextcloud.cli:main"
+oidc-necxtcloud = "ldap2nextcloud.cli:main"
+ldap2nextcloud = "ldap2nextcloud.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
