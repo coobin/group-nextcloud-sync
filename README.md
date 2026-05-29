@@ -1,23 +1,40 @@
 # group-nextcloud-sync
 
-`group-nextcloud-sync` 用于把 HR 人员信息同步到 Nextcloud 现有用户组。
+`group-nextcloud-sync` reads users and department groups from OpenLDAP and syncs
+them into Nextcloud.
 
-它不负责认证登录，认证由 OIDC（Authelia + Nextcloud user_oidc）完成；本项目只负责组成员关系维护。
+LDAP is the source of truth. The upstream HR system should sync into LDAP first
+using the separate `xrxs2ldap` service; this project no longer calls
+Xinrenxinshi directly.
 
-## 同步规则
+## Sync Rules
 
-1. 所有 HR 中 `active=true` 的员工都加入默认组（默认 `ALL`）。
-2. 按“HR 部门名 -> Nextcloud 组显示名（displayname）”匹配部门组。
-3. 仅当匹配到唯一显示名组时才加入。
-4. 未匹配到部门组时，不创建新组，用户只保留默认组。
-5. 对本工具管理范围内的组，会自动移除旧的部门组成员关系。
+1. LDAP users with `employeeType=active` are added to the default Nextcloud group
+   (`ALL` by default).
+2. LDAP `posixGroup` entries are matched to existing Nextcloud groups by
+   display name.
+3. LDAP group membership comes from `memberUid`; users can map to multiple
+   Nextcloud groups.
+4. Missing Nextcloud groups are not created, except the default group.
+5. For managed groups, stale Nextcloud memberships are removed.
+6. LDAP users with inactive status values are removed from managed groups.
+7. Inactive LDAP users are disabled in Nextcloud when
+   `NEXTCLOUD_DISABLE_INACTIVE_USERS=true`.
 
-## 数据来源
+## Data Source
 
-- `HR_SOURCE=json_file`：读取 `samples/hr_data.json`。
-- `HR_SOURCE=xinrenxinshi`：调用薪人薪事 API 拉取部门和人员。
+Default source:
 
-## 快速开始
+- `HR_SOURCE=ldap`: reads users from `ou=people` and groups from `ou=groups`.
+
+Development source:
+
+- `HR_SOURCE=json_file`: reads `samples/hr_data.json`.
+
+The old `xinrenxinshi` adapter is intentionally not wired in the CLI anymore.
+Use `xrxs2ldap` to populate LDAP from Xinrenxinshi.
+
+## Quick Start
 
 ```bash
 python3 -m venv .venv
@@ -25,31 +42,42 @@ python3 -m venv .venv
 cp .env.example .env
 ```
 
-先预览（不写入）：
+Preview without writing:
 
 ```bash
 group-nextcloud-sync --dry-run
 ```
 
-正式执行：
+Run for real:
 
 ```bash
 DRY_RUN=false group-nextcloud-sync
 ```
 
-兼容旧命令：
+Compatible command names:
 
 - `oidc-necxtcloud`
 - `ldap2nextcloud`
 
-## 关键配置
+## Key Configuration
 
 ```dotenv
-HR_SOURCE=xinrenxinshi
-XRXS_BASE_URL=https://api.xinrenxinshi.com
-XRXS_APP_ID=
-XRXS_APP_SECRET=
-XRXS_COMPANY_ID=
+HR_SOURCE=ldap
+DRY_RUN=true
+
+LDAP_URI=ldap://10.1.6.99:1389
+LDAP_BASE_DN=dc=chencytech,dc=com
+LDAP_BIND_DN=cn=admin,dc=chencytech,dc=com
+LDAP_BIND_PASSWORD=
+LDAP_PEOPLE_OU=ou=people
+LDAP_GROUPS_OU=ou=groups
+LDAP_USER_FILTER=(objectClass=inetOrgPerson)
+LDAP_GROUP_FILTER=(objectClass=posixGroup)
+LDAP_UID_ATTR=uid
+LDAP_DISPLAY_NAME_ATTR=displayName
+LDAP_EMAIL_ATTR=mail
+LDAP_STATUS_ATTR=employeeType
+LDAP_INACTIVE_STATUS_VALUES=inactive,deactive,disabled
 
 NEXTCLOUD_DB_HOST=db
 NEXTCLOUD_DB_PORT=3306
@@ -58,26 +86,38 @@ NEXTCLOUD_DB_USER=nextcloud
 NEXTCLOUD_DB_PASSWORD=
 NEXTCLOUD_DEFAULT_GROUP=ALL
 NEXTCLOUD_DEPARTMENT_GROUP_ALIASES=交付组=服务交付部,运维组=服务交付部
+
+NEXTCLOUD_DISABLE_INACTIVE_USERS=true
+NEXTCLOUD_DISABLE_INACTIVE_METHOD=db
+NEXTCLOUD_BASE_URL=https://nextcloud.example.com
+NEXTCLOUD_ADMIN_USER=
+NEXTCLOUD_ADMIN_PASSWORD=
 ```
 
-完整配置见 [.env.example](.env.example)。
+Group memberships are still written directly to the Nextcloud database, matching
+the original project behavior. Account disabling defaults to the same database
+path by setting `oc_preferences` `core/enabled=false`, matching Nextcloud's own
+`occ user:disable` behavior. If you prefer the Provisioning API, set
+`NEXTCLOUD_DISABLE_INACTIVE_METHOD=api` and configure admin credentials:
 
-## 日志说明
+```text
+PUT /ocs/v1.php/cloud/users/{userid}/disable
+```
 
-程序输出按级别标识：
+## Log Output
 
-- `[INFO]`：流程阶段与基础状态
-- `[WARN]`：缺失用户、未匹配部门组等可继续问题
-- `[ERROR]`：同步失败摘要
-- `[SUMMARY]`：本轮统计结果
+The program prints:
 
-## 开源前安全检查
+- `[INFO]`: state loading and mapping information
+- `[WARN]`: missing users, unmatched groups, skipped disables
+- `[ACTION]`: writes or dry-run writes
+- `[ERROR]`: failed sync summary
+- `[SUMMARY]`: final counters, including disabled users
 
-已默认通过 `.gitignore` 排除以下内容：
+## Safety Notes
 
-- `.env`
-- 本地虚拟环境与缓存
-- 私钥/证书文件（`*.key`, `*.pem`, `*.crt`, `*.p12`）
-- 打包产物（`*.tar.gz`, `*.tgz`, `*.zip`）
+Keep `DRY_RUN=true` until LDAP matching, group changes, and inactive-user disable
+actions look correct.
 
-请确认提交前仅保留示例配置，不提交任何真实账号、密码、密钥或 token。
+The repository ignores local secrets such as `.env`, private keys, virtual
+environments, and build archives.

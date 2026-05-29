@@ -18,6 +18,7 @@ class Employee:
     display_name: str
     email: str | None = None
     department_id: str | None = None
+    department_ids: tuple[str, ...] = ()
     title: str | None = None
     manager_employee_id: str | None = None
     first_name: str | None = None

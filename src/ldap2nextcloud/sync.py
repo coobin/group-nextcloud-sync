@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+import json
+from urllib.parse import quote
 
 import pymysql
 import pymysql.cursors
+import requests
 
 from ldap2nextcloud.config import Settings
 from ldap2nextcloud.models import HrSnapshot
@@ -25,6 +28,8 @@ class GroupSyncStats:
     managed_groups: int = 0
     memberships_added: int = 0
     memberships_removed: int = 0
+    users_disabled: int = 0
+    users_disable_skipped: int = 0
 
 
 class NextcloudGroupSyncService:
@@ -35,6 +40,7 @@ class NextcloudGroupSyncService:
         stats = GroupSyncStats()
         unmatched_only_default_details: list[tuple[str, str, str]] = []
         stats.departments_seen = len(snapshot.departments)
+        self._validate_disable_config()
         self._ensure_group(self.settings.nextcloud_default_group)
 
         groups = self._load_groups()
@@ -68,6 +74,7 @@ class NextcloudGroupSyncService:
             if not employee.active:
                 stats.inactive_users_seen += 1
                 self._remove_user_from_managed_groups(target_uid, memberships, managed_gids, stats)
+                self._disable_inactive_user(target_uid, users, stats)
                 continue
 
             stats.users_seen += 1
@@ -78,8 +85,10 @@ class NextcloudGroupSyncService:
                 continue
 
             desired_gids = {self.settings.nextcloud_default_group}
-            department = departments_by_id.get(employee.department_id or "")
-            if department is not None:
+            for department_id in self._employee_department_ids(employee):
+                department = departments_by_id.get(department_id)
+                if department is None:
+                    continue
                 target_display_name = self.settings.nextcloud_department_group_aliases.get(
                     department.name,
                     department.name,
@@ -123,6 +132,31 @@ class NextcloudGroupSyncService:
                     f"uid={uid} department={department} target={target}",
                 )
         return stats
+
+    def _validate_disable_config(self) -> None:
+        if (
+            self.settings.dry_run
+            or not self.settings.nextcloud_disable_inactive_users
+            or self.settings.nextcloud_disable_inactive_method == "db"
+            or (
+                self.settings.nextcloud_base_url
+                and self.settings.nextcloud_admin_user
+                and self.settings.nextcloud_admin_password
+            )
+        ):
+            return
+        raise RuntimeError(
+            "NEXTCLOUD_BASE_URL, NEXTCLOUD_ADMIN_USER, and NEXTCLOUD_ADMIN_PASSWORD "
+            "are required when NEXTCLOUD_DISABLE_INACTIVE_USERS=true and "
+            "NEXTCLOUD_DISABLE_INACTIVE_METHOD=api"
+        )
+
+    def _employee_department_ids(self, employee) -> tuple[str, ...]:
+        if employee.department_ids:
+            return employee.department_ids
+        if employee.department_id:
+            return (employee.department_id,)
+        return ()
 
     def _index_groups_by_display_name(
         self,
@@ -209,13 +243,84 @@ class NextcloudGroupSyncService:
         )
         self._log("ACTION", f"removed uid={uid} gid={gid}")
 
+    def _disable_inactive_user(self, uid: str, users: set[str], stats: GroupSyncStats) -> None:
+        if not self.settings.nextcloud_disable_inactive_users:
+            return
+        if uid not in users:
+            stats.users_disable_skipped += 1
+            self._log("WARN", f"skip disable missing nextcloud user uid={uid}")
+            return
+        if self.settings.dry_run:
+            stats.users_disabled += 1
+            self._log("ACTION", f"DRY-RUN disable nextcloud user uid={uid}")
+            return
+        if self.settings.nextcloud_disable_inactive_method == "db":
+            self._disable_user_in_db(uid)
+            stats.users_disabled += 1
+            self._log("ACTION", f"disabled nextcloud user uid={uid} method=db")
+            return
+        if (
+            not self.settings.nextcloud_base_url
+            or not self.settings.nextcloud_admin_user
+            or not self.settings.nextcloud_admin_password
+        ):
+            raise RuntimeError(
+                "NEXTCLOUD_BASE_URL, NEXTCLOUD_ADMIN_USER, and NEXTCLOUD_ADMIN_PASSWORD "
+                "are required to disable inactive users"
+            )
+
+        base_url = self.settings.nextcloud_base_url.rstrip("/")
+        user_id = quote(uid, safe="")
+        response = requests.put(
+            f"{base_url}/ocs/v1.php/cloud/users/{user_id}/disable",
+            params={"format": "json"},
+            headers={"OCS-APIRequest": "true"},
+            auth=(self.settings.nextcloud_admin_user, self.settings.nextcloud_admin_password),
+            timeout=self.settings.nextcloud_api_timeout_seconds,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"failed to disable nextcloud user uid={uid}: "
+                f"http_status={response.status_code} body={response.text[:300]}"
+            )
+        payload = response.json()
+        meta = payload.get("ocs", {}).get("meta", {})
+        if int(meta.get("statuscode", 0)) != 100:
+            raise RuntimeError(
+                f"failed to disable nextcloud user uid={uid}: "
+                f"ocs_status={meta.get('status')} message={meta.get('message')}"
+            )
+        stats.users_disabled += 1
+        self._log("ACTION", f"disabled nextcloud user uid={uid}")
+
+    def _disable_user_in_db(self, uid: str) -> None:
+        self._execute(
+            "INSERT INTO oc_preferences (userid, appid, configkey, configvalue) "
+            "VALUES (%s, 'core', 'enabled', 'false') "
+            "ON DUPLICATE KEY UPDATE configvalue = 'false'",
+            (uid,),
+        )
+
     def _load_groups(self) -> dict[str, str]:
         rows = self._query("SELECT gid, displayname FROM oc_groups")
         return {row["gid"]: row["displayname"] for row in rows}
 
     def _load_users(self) -> set[str]:
-        rows = self._query("SELECT uid FROM oc_users")
-        return {row["uid"] for row in rows}
+        users: set[str] = set()
+        for row in self._query("SELECT uid FROM oc_users"):
+            uid = row.get("uid", "").strip()
+            if uid:
+                users.add(uid)
+        try:
+            account_rows = self._query("SELECT uid FROM oc_accounts")
+        except Exception as exc:
+            self._log("WARN", f"failed to load oc_accounts users: {exc}")
+            account_rows = []
+        for row in account_rows:
+            uid = row.get("uid", "").strip()
+            if uid:
+                users.add(uid)
+        return users
 
     def _load_users_by_email(self, users: set[str]) -> dict[str, list[str]]:
         rows = self._query(
@@ -230,7 +335,38 @@ class NextcloudGroupSyncService:
             email = row["configvalue"].strip().lower()
             if uid in users and email:
                 users_by_email[email].append(uid)
-        return users_by_email
+        for uid, email in self._load_account_emails():
+            if uid in users and email:
+                users_by_email[email].append(uid)
+
+        normalized: dict[str, list[str]] = {}
+        for email, candidates in users_by_email.items():
+            normalized[email] = sorted(set(candidates))
+        return normalized
+
+    def _load_account_emails(self) -> list[tuple[str, str]]:
+        try:
+            rows = self._query("SELECT uid, data FROM oc_accounts WHERE data <> ''")
+        except Exception as exc:
+            self._log("WARN", f"failed to load oc_accounts emails: {exc}")
+            return []
+
+        result: list[tuple[str, str]] = []
+        for row in rows:
+            uid = row.get("uid", "").strip()
+            raw_data = row.get("data", "")
+            if not uid or not raw_data:
+                continue
+            try:
+                payload = json.loads(raw_data)
+            except json.JSONDecodeError:
+                continue
+            email_value = payload.get("email", {}).get("value")
+            if isinstance(email_value, str):
+                email = email_value.strip().lower()
+                if email:
+                    result.append((uid, email))
+        return result
 
     def _resolve_target_uid(
         self,

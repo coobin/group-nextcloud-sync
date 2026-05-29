@@ -6,8 +6,9 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from ldap2nextcloud.adapters.ldap import LdapAdapter
 from ldap2nextcloud.adapters.json_file import JsonFileAdapter
-from ldap2nextcloud.adapters.xinrenxinshi import XinrenxinshiAdapter
+# from ldap2nextcloud.adapters.xinrenxinshi import XinrenxinshiAdapter
 from ldap2nextcloud.config import load_settings
 from ldap2nextcloud.sync import NextcloudGroupSyncService
 
@@ -41,10 +42,13 @@ def _timestamp() -> str:
 
 
 def _build_adapter(settings):
+    if settings.hr_source == "ldap":
+        return LdapAdapter(settings)
     if settings.hr_source == "json_file":
         return JsonFileAdapter(settings.json_file_path or "samples/hr_data.json")
-    if settings.hr_source == "xinrenxinshi":
-        return XinrenxinshiAdapter(settings)
+    # Xinrenxinshi is intentionally disabled here. LDAP is the source of truth.
+    # if settings.hr_source == "xinrenxinshi":
+    #     return XinrenxinshiAdapter(settings)
     raise ValueError(f"Unsupported HR_SOURCE: {settings.hr_source}")
 
 
@@ -87,6 +91,8 @@ def main() -> int:
             "managed_groups": stats.managed_groups,
             "memberships_added": stats.memberships_added,
             "memberships_removed": stats.memberships_removed,
+            "users_disabled": stats.users_disabled,
+            "users_disable_skipped": stats.users_disable_skipped,
             "dry_run": settings.dry_run,
         },
     )
